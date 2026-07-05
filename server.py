@@ -18,6 +18,7 @@ from starlette.responses import HTMLResponse, RedirectResponse
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from garmin_client import call_with_relogin, get_client
 from oauth_provider import GarminAuthProvider
@@ -25,6 +26,10 @@ from workouts import build_custom_workout, build_easy_run_workout, build_interva
 
 ISSUER_URL = os.environ["ISSUER_URL"]  # z.B. https://garmin-mcp.onrender.com (OHNE trailing slash)
 LOGIN_PASSWORD = os.environ["MCP_LOGIN_PASSWORD"]
+
+# Hostname aus ISSUER_URL extrahieren, damit die DNS-Rebinding-Schutzpruefung
+# der SDK Anfragen an genau diesen Host durchlaesst (sonst 421 Misdirected Request).
+_issuer_host = ISSUER_URL.split("://", 1)[-1].split("/", 1)[0]
 
 auth_provider = GarminAuthProvider(issuer_url=ISSUER_URL, password=LOGIN_PASSWORD)
 
@@ -41,6 +46,11 @@ mcp = FastMCP(
         ),
         revocation_options=RevocationOptions(enabled=True),
         required_scopes=["garmin"],
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_issuer_host, "localhost", "127.0.0.1"],
+        allowed_origins=["https://claude.ai", "https://*.claude.ai", "https://*.anthropic.com"],
     ),
 )
 
