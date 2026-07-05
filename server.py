@@ -208,10 +208,18 @@ async def create_interval_workout(
     recovery_secs: int = 120,
     cooldown_secs: int = 600,
     schedule_date: str | None = None,
+    target_hr_min: int | None = None,
+    target_hr_max: int | None = None,
+    target_pace_fast_sec_per_km: int | None = None,
+    target_pace_slow_sec_per_km: int | None = None,
 ) -> dict:
     """Erstellt ein strukturiertes Intervall-Workout (Warmup - N x Intervall/Erholung -
     Cooldown) und laedt es zu Garmin Connect hoch. Optional wird es direkt auf ein
-    Datum eingeplant, damit es automatisch aufs Geraet synct.
+    Datum eingeplant, damit es automatisch aufs Geraet synct. Die Uhr zeigt waehrend
+    des Laufs jeden Step einzeln an (nicht nur "Aufwaermen" fuer die ganze Dauer).
+
+    Fuer die Intervall-Steps kann optional EIN Ziel angegeben werden: entweder ein
+    Puls-Bereich (target_hr_min/max) ODER ein Pace-Bereich (target_pace_*), nicht beides.
 
     Args:
         name: Name des Workouts, z.B. "6x800m Intervalle"
@@ -221,10 +229,19 @@ async def create_interval_workout(
         recovery_secs: Erholungsdauer zwischen Intervallen in Sekunden
         cooldown_secs: Cooldown-Dauer in Sekunden
         schedule_date: Optional, Datum im Format YYYY-MM-DD zum Einplanen
+        target_hr_min: Optional, untere Pulsgrenze in bpm fuer die Intervalle
+        target_hr_max: Optional, obere Pulsgrenze in bpm fuer die Intervalle
+        target_pace_fast_sec_per_km: Optional, schnellere Pace-Grenze in Sek/km (z.B. 270 = 4:30/km)
+        target_pace_slow_sec_per_km: Optional, langsamere Pace-Grenze in Sek/km (z.B. 300 = 5:00/km)
     """
 
     def _do():
-        workout = build_interval_workout(name, warmup_secs, interval_meters, interval_count, recovery_secs, cooldown_secs)
+        workout = build_interval_workout(
+            name, warmup_secs, interval_meters, interval_count, recovery_secs, cooldown_secs,
+            target_hr_min=target_hr_min, target_hr_max=target_hr_max,
+            target_pace_fast_sec_per_km=target_pace_fast_sec_per_km,
+            target_pace_slow_sec_per_km=target_pace_slow_sec_per_km,
+        )
         return upload_and_schedule(get_client(), workout, schedule_date)
 
     return await asyncio.to_thread(_do)
@@ -233,17 +250,36 @@ async def create_interval_workout(
 @mcp.tool(
     annotations={"title": "Create Easy Run", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
 )
-async def create_easy_run(name: str = "Easy Run", duration_secs: int = 1800, schedule_date: str | None = None) -> dict:
+async def create_easy_run(
+    name: str = "Easy Run",
+    duration_secs: int = 1800,
+    schedule_date: str | None = None,
+    target_hr_min: int | None = None,
+    target_hr_max: int | None = None,
+    target_pace_fast_sec_per_km: int | None = None,
+    target_pace_slow_sec_per_km: int | None = None,
+) -> dict:
     """Erstellt einen einfachen, unstrukturierten lockeren Dauerlauf und laedt ihn hoch.
+    Optional mit einem Puls- oder Pace-Zielbereich (z.B. um sicherzustellen, dass der
+    Lauf wirklich locker/Zone 2 bleibt).
 
     Args:
         name: Name des Workouts
         duration_secs: Dauer in Sekunden
         schedule_date: Optional, Datum im Format YYYY-MM-DD zum Einplanen
+        target_hr_min: Optional, untere Pulsgrenze in bpm
+        target_hr_max: Optional, obere Pulsgrenze in bpm
+        target_pace_fast_sec_per_km: Optional, schnellere Pace-Grenze in Sek/km
+        target_pace_slow_sec_per_km: Optional, langsamere Pace-Grenze in Sek/km
     """
 
     def _do():
-        workout = build_easy_run_workout(name, duration_secs)
+        workout = build_easy_run_workout(
+            name, duration_secs,
+            target_hr_min=target_hr_min, target_hr_max=target_hr_max,
+            target_pace_fast_sec_per_km=target_pace_fast_sec_per_km,
+            target_pace_slow_sec_per_km=target_pace_slow_sec_per_km,
+        )
         return upload_and_schedule(get_client(), workout, schedule_date)
 
     return await asyncio.to_thread(_do)
@@ -262,6 +298,11 @@ async def create_custom_workout(name: str, steps: list[dict], schedule_date: str
       {"type": "interval", "duration_seconds": 300}  ODER {"type": "interval", "distance_meters": 1000}
       {"type": "recovery", "duration_seconds": 90}   ODER {"type": "recovery", "distance_meters": 200}
       {"type": "repeat", "count": 4, "steps": [ ... verschachtelte Steps ... ]}
+
+    Jeder Step (ausser repeat) kann optional ein "target" enthalten:
+      {"kind": "heart_rate", "min_bpm": 150, "max_bpm": 165}
+      {"kind": "pace", "fast_sec_per_km": 270, "slow_sec_per_km": 300}
+    Beispiel: {"type": "interval", "distance_meters": 1000, "target": {"kind": "heart_rate", "min_bpm": 165, "max_bpm": 178}}
 
     Args:
         name: Name des Workouts
