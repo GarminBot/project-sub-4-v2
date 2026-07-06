@@ -1,31 +1,26 @@
 """
 Minimaler OAuth-2.1-Authorization-Server, eingebettet im MCP-Server selbst.
 
-Gedacht fuer EINEN einzigen Nutzer (dich). Es gibt keine Nutzerverwaltung -
-"Login" bedeutet: ein Passwort eingeben (MCP_LOGIN_PASSWORD), das nur du kennst.
-Danach bekommt Claude einen Access-Token fuer deinen persoenlichen Garmin-Zugang.
+Diese Version ist fuer einen persoenlichen Claude-Connector optimiert:
+- Optional ohne Passwortabfrage: MCP_AUTO_APPROVE=true
+- OAuth-Clients und Tokens werden in eine JSON-Datei geschrieben, damit Claude
+  nach einem App-Neustart nicht sofort neu verbunden werden muss.
 
-WICHTIG (Speicher-Limitierung): Alle Clients/Codes/Tokens liegen nur im
-Prozess-Speicher (RAM). Auf Render Free Tier wird der Prozess nach Inaktivitaet
-komplett neu gestartet -> dabei gehen bestehende Sessions verloren und du musst
-den Connector in Claude einmal neu verbinden (Settings -> Connectors -> Reconnect).
-Fuer ein Hobby-Projekt ist das ein akzeptabler Kompromiss; falls es nervt, hilft
-ein bezahlter Render-Plan mit "always on" (kein Spin-down mehr).
-
-Ablauf:
-1. Claude ruft GET /authorize auf (macht der SDK-Code automatisch) -> authorize()
-   wird aufgerufen -> wir merken uns die Anfrage unter einer request_id und
-   schicken den Browser zu unserer eigenen Login-Seite (/login?request_id=...).
-2. Du gibst dort das Passwort ein (POST /login in server.py).
-3. Bei Erfolg generieren wir einen Authorization Code und leiten zurueck zu
-   Claudes redirect_uri (inkl. code + state).
-4. Claude tauscht den Code gegen Access-/Refresh-Token (exchange_authorization_code).
+Wichtig: Auf Render Free kann der Dienst trotzdem einschlafen oder neu gestartet
+werden. Damit die Verbindung wirklich stabil bleibt, braucht es entweder einen
+Always-on/paid Render Service oder einen externen Uptime-Ping. Fuer Token-Persistenz
+nach einem Neustart sollte TOKEN_STORE_PATH auf einen persistenten Render-Disk-Pfad
+zeigen, z.B. /var/data/mcp_oauth_store.json.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import secrets
 import time
+from pathlib import Path
+from typing import Any
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -33,37 +28,108 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
     RefreshToken,
-    TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 Tage
-AUTH_CODE_TTL_SECONDS = 5 * 60  # 5 Minuten zum Login
+# Claude soll moeglichst lange verbunden bleiben. Ein Refresh Token bleibt
+# zusaetzlich im Store erhalten, solange der Store nicht geloescht wird.
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365  # 365 Tage
+AUTH_CODE_TTL_SECONDS = 5 * 60  # 5 Minuten
+
+
+def _model_to_dict(model: Any) -> dict[str, Any]:
+    """Pydantic v1/v2 kompatibel serialisieren."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json")
+    return model.dict()
 
 
 class GarminAuthProvider(OAuthAuthorizationServerProvider):
-    def __init__(self, issuer_url: str, password: str):
+    def __init__(
+        self,
+        issuer_url: str,
+        password: str | None = None,
+        auto_approve: bool = True,
+        store_path: str | None = None,
+    ):
         self.issuer_url = issuer_url.rstrip("/")
-        self.password = password
+        self.password = password or ""
+        self.auto_approve = auto_approve
+        self.store_path = Path(store_path) if store_path else None
 
         self.clients: dict[str, OAuthClientInformationFull] = {}
-        self.pending: dict[str, tuple[str, AuthorizationParams]] = {}  # request_id -> (client_id, params)
+        self.pending: dict[str, tuple[str, AuthorizationParams]] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
         self.refresh_tokens: dict[str, RefreshToken] = {}
 
-    # --- Client-Registrierung (Dynamic Client Registration) ---
+        self._load_store()
+
+    # ------------------------------------------------------------------
+    # Persistenz
+    # ------------------------------------------------------------------
+
+    def _load_store(self) -> None:
+        if not self.store_path or not self.store_path.exists():
+            return
+        try:
+            data = json.loads(self.store_path.read_text(encoding="utf-8"))
+
+            self.clients = {
+                item["client_id"]: OAuthClientInformationFull(**item)
+                for item in data.get("clients", [])
+                if item.get("client_id")
+            }
+            self.access_tokens = {
+                item["token"]: AccessToken(**item)
+                for item in data.get("access_tokens", [])
+                if item.get("token")
+            }
+            self.refresh_tokens = {
+                item["token"]: RefreshToken(**item)
+                for item in data.get("refresh_tokens", [])
+                if item.get("token")
+            }
+        except Exception:
+            # Defekter Store soll den Server nicht blockieren.
+            self.clients = {}
+            self.access_tokens = {}
+            self.refresh_tokens = {}
+
+    def _save_store(self) -> None:
+        if not self.store_path:
+            return
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "clients": [_model_to_dict(client) for client in self.clients.values()],
+            "access_tokens": [_model_to_dict(token) for token in self.access_tokens.values()],
+            "refresh_tokens": [_model_to_dict(token) for token in self.refresh_tokens.values()],
+            "saved_at": int(time.time()),
+        }
+        tmp_path = self.store_path.with_suffix(self.store_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.store_path)
+
+    # ------------------------------------------------------------------
+    # Client-Registrierung
+    # ------------------------------------------------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self.clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.clients[client_info.client_id] = client_info
+        self._save_store()
 
-    # --- Authorization-Code-Flow ---
+    # ------------------------------------------------------------------
+    # Authorization-Code-Flow
+    # ------------------------------------------------------------------
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        if self.auto_approve:
+            return self._issue_authorization_code(client.client_id, params)
+
         request_id = secrets.token_urlsafe(24)
         self.pending[request_id] = (client.client_id, params)
         return f"{self.issuer_url}/login?request_id={request_id}"
@@ -72,14 +138,13 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
         return self.pending.get(request_id)
 
     def complete_login(self, request_id: str) -> str:
-        """Wird von der /login-POST-Route in server.py aufgerufen, NACHDEM das
-        Passwort erfolgreich geprueft wurde. Erzeugt den Authorization Code und
-        gibt die fertige Redirect-URL zurueck."""
         pending = self.pending.pop(request_id, None)
         if pending is None:
             raise ValueError("Unbekannte oder abgelaufene request_id.")
         client_id, params = pending
+        return self._issue_authorization_code(client_id, params)
 
+    def _issue_authorization_code(self, client_id: str, params: AuthorizationParams) -> str:
         code = secrets.token_urlsafe(32)
         self.auth_codes[code] = AuthorizationCode(
             code=code,
@@ -125,6 +190,7 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
             client_id=client.client_id,
             scopes=authorization_code.scopes,
         )
+        self._save_store()
 
         return OAuthToken(
             access_token=access_token,
@@ -134,7 +200,9 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
             scope=" ".join(authorization_code.scopes),
         )
 
-    # --- Refresh-Token-Flow ---
+    # ------------------------------------------------------------------
+    # Refresh-Token-Flow
+    # ------------------------------------------------------------------
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
         token = self.refresh_tokens.get(refresh_token)
@@ -148,7 +216,6 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Alten Refresh-Token invalidieren, neue Tokens ausstellen (Rotation)
         self.refresh_tokens.pop(refresh_token.token, None)
 
         granted_scopes = scopes or refresh_token.scopes
@@ -167,6 +234,7 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
             client_id=client.client_id,
             scopes=granted_scopes,
         )
+        self._save_store()
 
         return OAuthToken(
             access_token=new_access,
@@ -176,7 +244,9 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
             scope=" ".join(granted_scopes),
         )
 
-    # --- Access-Token-Verifikation ---
+    # ------------------------------------------------------------------
+    # Access-Token-Verifikation
+    # ------------------------------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         access_token = self.access_tokens.get(token)
@@ -184,9 +254,11 @@ class GarminAuthProvider(OAuthAuthorizationServerProvider):
             return None
         if access_token.expires_at is not None and access_token.expires_at < time.time():
             del self.access_tokens[token]
+            self._save_store()
             return None
         return access_token
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         self.access_tokens.pop(token.token, None)
         self.refresh_tokens.pop(token.token, None)
+        self._save_store()

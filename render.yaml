@@ -2,15 +2,26 @@ services:
   - type: web
     name: garmin-mcp
     env: python
-    plan: free
+    # Fuer "immer verbunden" ist ein Always-on Plan besser als Free.
+    # Auf Free kann Render den Dienst schlafen legen oder neu starten.
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: mcp-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: GARMIN_EMAIL
         sync: false
       - key: GARMIN_PASSWORD
         sync: false
-      - key: MCP_LOGIN_PASSWORD
-        sync: false
       - key: ISSUER_URL
+        sync: false
+      - key: MCP_AUTO_APPROVE
+        value: "true"
+      - key: TOKEN_STORE_PATH
+        value: /var/data/mcp_oauth_store.json
+      # Nur noetig, falls du MCP_AUTO_APPROVE=false setzen willst.
+      - key: MCP_LOGIN_PASSWORD
         sync: false

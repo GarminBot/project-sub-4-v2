@@ -25,13 +25,20 @@ from oauth_provider import GarminAuthProvider
 from workouts import build_custom_workout, build_easy_run_workout, build_interval_workout, upload_and_schedule
 
 ISSUER_URL = os.environ["ISSUER_URL"]  # z.B. https://garmin-mcp.onrender.com (OHNE trailing slash)
-LOGIN_PASSWORD = os.environ["MCP_LOGIN_PASSWORD"]
+LOGIN_PASSWORD = os.environ.get("MCP_LOGIN_PASSWORD", "")
+MCP_AUTO_APPROVE = os.environ.get("MCP_AUTO_APPROVE", "true").lower() in {"1", "true", "yes", "on"}
+TOKEN_STORE_PATH = os.environ.get("TOKEN_STORE_PATH", "/tmp/mcp_oauth_store.json")
 
 # Hostname aus ISSUER_URL extrahieren, damit die DNS-Rebinding-Schutzpruefung
 # der SDK Anfragen an genau diesen Host durchlaesst (sonst 421 Misdirected Request).
 _issuer_host = ISSUER_URL.split("://", 1)[-1].split("/", 1)[0]
 
-auth_provider = GarminAuthProvider(issuer_url=ISSUER_URL, password=LOGIN_PASSWORD)
+auth_provider = GarminAuthProvider(
+    issuer_url=ISSUER_URL,
+    password=LOGIN_PASSWORD,
+    auto_approve=MCP_AUTO_APPROVE,
+    store_path=TOKEN_STORE_PATH,
+)
 
 mcp = FastMCP(
     "garmin_mcp",
@@ -364,6 +371,11 @@ LOGIN_PAGE = """
 
 async def login_get(request: Request) -> HTMLResponse:
     request_id = request.query_params.get("request_id", "")
+    if MCP_AUTO_APPROVE:
+        if auth_provider.get_pending(request_id) is None:
+            return HTMLResponse("Auto-Freigabe ist aktiv. Bitte den Connector direkt aus Claude verbinden.", status_code=400)
+        redirect_url = auth_provider.complete_login(request_id)
+        return RedirectResponse(redirect_url, status_code=302)
     return HTMLResponse(LOGIN_PAGE.format(request_id=request_id, error=""))
 
 
@@ -375,7 +387,7 @@ async def login_post(request: Request):
     if auth_provider.get_pending(request_id) is None:
         return HTMLResponse("Session abgelaufen. Bitte den Connector in Claude erneut verbinden.", status_code=400)
 
-    if password != LOGIN_PASSWORD:
+    if not MCP_AUTO_APPROVE and password != LOGIN_PASSWORD:
         return HTMLResponse(
             LOGIN_PAGE.format(request_id=request_id, error='<span class="error">Falsches Passwort.</span>'),
             status_code=401,
