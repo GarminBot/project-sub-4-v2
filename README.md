@@ -1,204 +1,139 @@
 # Garmin MCP Server
 
-Remote-MCP-Server fuer Garmin Connect, damit Claude deine Garmin-Daten lesen und Workouts erstellen/planen kann.
+Echter Remote-MCP-Server für Garmin Connect (Streamable HTTP + eigener
+OAuth-2.1-Mini-Server). Damit kann Claude direkt als "Custom Connector"
+(Claude-Einstellungen → Connectors) angebunden werden – funktioniert dann in
+claude.ai, Claude Desktop, Mobile und Cowork gleichermassen, und Claude kann
+sowohl Daten lesen als auch (richtig, per Tool-Call statt GET-Trick) Workouts
+erstellen.
 
-## Was in dieser Version geaendert wurde
+## Dein Login-Passwort
 
-- **Keine Passwortabfrage mehr beim Verbinden mit Claude**  
-  `MCP_AUTO_APPROVE=true` gibt die Claude-Verbindung automatisch frei.
-
-- **Claude bleibt deutlich stabiler verbunden**  
-  OAuth-Clients und Tokens werden nicht mehr nur im RAM gespeichert, sondern in eine JSON-Datei geschrieben:  
-  `TOKEN_STORE_PATH=/var/data/mcp_oauth_store.json`
-
-- **Tokens laufen viel laenger**  
-  Access Tokens sind neu 365 Tage gueltig.
-
-- **Render ist auf Always-on ausgelegt**  
-  `render.yaml` ist auf `plan: starter` gestellt und nutzt eine persistente Disk unter `/var/data`.
-
-## Wichtig
-
-Ganz ohne Passwort ist bequemer, aber weniger geschuetzt. Jeder, der deine Render-URL kennt und einen OAuth-Flow startet, koennte theoretisch Zugriff freigeben. Verwende deshalb ein **privates GitHub-Repo** und teile die Render-URL nicht oeffentlich.
-
-„Immer verbunden“ funktioniert zuverlaessig nur, wenn Render den Dienst nicht staendig schlafen legt und die Token-Datei erhalten bleibt. Darum ist in `render.yaml` ein **Starter/Always-on Plan mit persistenter Disk** vorgesehen. Auf dem Free Plan kann Render den Dienst trotzdem schlafen legen oder neu starten; dann kann Claude je nach Situation wieder eine Neuverbindung brauchen.
-
-## Render Environment Variables
-
-Setze in Render diese Werte:
-
-```text
-GARMIN_EMAIL=deine Garmin E-Mail
-GARMIN_PASSWORD=dein Garmin Passwort
-ISSUER_URL=https://deine-render-url.onrender.com
-MCP_AUTO_APPROVE=true
-TOKEN_STORE_PATH=/var/data/mcp_oauth_store.json
+```
+x-kg927YDuER31Q2YN6EiYxv1mqWhcDd
 ```
 
-`MCP_LOGIN_PASSWORD` ist nur noch noetig, wenn du die Passwortabfrage wieder aktivieren willst.
+Das ist NICHT dein Garmin-Passwort, sondern das Passwort für die Login-Seite
+des MCP-Servers selbst (die du einmalig beim Verbinden im Browser siehst).
+Halte es geheim, nicht auf GitHub committen.
 
-## Passwortabfrage wieder aktivieren
+## 1. Code auf GitHub bringen
 
-Falls du spaeter wieder ein Login-Passwort willst:
+Gleich wie beim letzten Mal (siehe vorheriges README), z.B. über die
+GitHub-Weboberfläche: neues **privates** Repo erstellen, alle Dateien aus
+`garmin_mcp/` hochladen (ausser `.env`, falls vorhanden).
 
-```text
-MCP_AUTO_APPROVE=false
-MCP_LOGIN_PASSWORD=dein eigenes Passwort
-```
+## 2. Web Service auf Render.com erstellen
 
-Danach Render neu deployen.
+1. **New → Web Service**, dein Repo verbinden
+2. Einstellungen:
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `uvicorn server:app --host 0.0.0.0 --port $PORT`
+   - **Instance Type:** Free
+3. **Environment Variables** hinzufügen:
+   - `GARMIN_EMAIL` = deine Garmin-Login-Email
+   - `GARMIN_PASSWORD` = dein Garmin-Passwort
+   - `MCP_LOGIN_PASSWORD` = das Passwort von oben
+   - `ISSUER_URL` = **musst du nach dem ersten Deploy nachtragen** (siehe Schritt 3)
+4. **Create Web Service**
 
-## Deployment
+## 3. ISSUER_URL nachtragen (wichtig!)
 
-1. Dateien in dein privates GitHub-Repo hochladen.
-2. Render Web Service mit dem Repo verbinden.
-3. Environment Variables setzen.
-4. Nach dem ersten Deploy die definitive Render-URL als `ISSUER_URL` eintragen.
-5. Neu deployen.
-6. In Claude den Custom Connector mit dieser URL verbinden:
+Render gibt dir erst nach dem ersten Deploy deine endgültige URL, z.B.
+`https://garmin-mcp-xyz1.onrender.com`. Diese URL musst du:
 
-```text
-https://DEINE-URL.onrender.com/mcp
-```
+1. Als `ISSUER_URL` in die Environment Variables eintragen (ohne Slash am Ende!)
+2. Danach: **Manual Deploy → Deploy latest commit**, damit der Server mit der
+   korrekten URL neu startet (der OAuth-Server muss seine eigene URL kennen,
+   um korrekte Redirect-Links zu bauen).
 
-Claude sollte nun ohne Passwortabfrage durchverbinden.
+## 4. Als Custom Connector in Claude verbinden
 
-## Verfuegbare Tools
+1. Claude-Einstellungen → **Connectors** → **Add custom connector**
+2. URL eintragen: `https://DEINE-URL.onrender.com/mcp`
+3. **Connect** klicken → du wirst zu deiner eigenen Login-Seite weitergeleitet
+4. Passwort (von oben) eingeben → **Freigeben**
+5. Claude zeigt "Connected" – fertig
 
-Diese Version enthaelt deutlich mehr Garmin-Tools. Die wichtigsten Tools fuer deinen Laufplan sind weiterhin direkt verfuegbar; zusaetzlich gibt es viele Detail-, Analyse-, Profil-, Geraete-, Gesundheits-, Gear- und Planungsfunktionen.
+Danach kannst du den Connector pro Chat über den "+"-Button unten links
+(„Connectors") ein-/ausschalten.
 
-### Basis fuer Trainingsplanung
+## 5. Dauerhafte Verbindung einrichten (Upstash Redis)
 
-- `get_full_export`
-- `get_activities`
-- `get_training_status`
-- `get_training_readiness`
-- `get_morning_training_readiness`
-- `get_race_predictions`
-- `get_race_predictions_history`
-- `get_sleep`
-- `get_hrv`
-- `get_body_battery`
-- `get_stress`
-- `get_user_summary`
-- `get_stats`
-- `get_stats_and_body`
+**Warum das nötig ist:** Ohne diesen Schritt gehen alle Verbindungen bei jedem
+Render-Neustart verloren (Cold-Start nach 15 Min. Inaktivität, oder Redeploy) -
+du müsstest den Connector in Claude dann jedes Mal neu verbinden. Mit Upstash
+bleibt die Verbindung dauerhaft bestehen, genau wie bei Strava.
 
-### Aktivitaeten und Detailanalyse
+1. Gratis-Account auf **upstash.com** erstellen (keine Kreditkarte nötig)
+2. **Create Database** → Typ **Redis** → Region möglichst nah an deiner Render-Region wählen
+3. Auf der Datenbank-Seite unter **REST API** findest du zwei Werte:
+   - `UPSTASH_REDIS_REST_URL`
+   - `UPSTASH_REDIS_REST_TOKEN`
+4. Beide als Environment Variables in deinem Render Web Service eintragen
+   (gleiche Stelle wie `GARMIN_EMAIL` etc.)
+5. Render deployed automatisch neu
 
-- `count_activities`
-- `get_activities_page`
-- `get_activities_for_date`
-- `get_activity`
-- `get_activity_details`
-- `get_activity_splits`
-- `get_activity_split_summaries`
-- `get_activity_typed_splits`
-- `get_activity_hr_in_timezones`
-- `get_activity_power_in_timezones`
-- `get_activity_weather`
-- `get_activity_gear`
-- `get_activity_exercise_sets`
-- `get_last_activity`
-- `get_activity_types`
+Danach bleiben Client-Registrierung, Access-Token und Refresh-Token dauerhaft
+gespeichert - ein Neustart des Render-Prozesses hat keinen Einfluss mehr auf
+eine bestehende Claude-Verbindung. Falls du diesen Schritt auslässt, läuft
+alles trotzdem (Fallback auf In-Memory-Speicherung), nur eben mit dem
+"jedes Mal neu verbinden"-Problem.
 
-### Form, Zonen und Leistungsmetriken
+## Wichtige Einschränkungen (Free Tier)
 
-- `get_lactate_threshold`
-- `get_cycling_ftp`
-- `get_endurance_score`
-- `get_hill_score`
-- `get_running_tolerance`
-- `get_personal_record`
-- `get_progress_summary_between_dates`
-- `get_max_metrics`
-- `get_fitnessage_data`
+- **Cold Start:** 30–60 Sekunden nach 15 Minuten Inaktivität, wie beim letzten
+  Server auch.
+- **Sessions gehen bei Neustart verloren, falls Upstash nicht eingerichtet
+  ist** (siehe Schritt 5): ohne Upstash liegen OAuth-Tokens nur im
+  Arbeitsspeicher, dann musst du den Connector nach jedem Neustart neu
+  verbinden. Mit Upstash (empfohlen, kostenlos) bleibt die Verbindung
+  dauerhaft bestehen.
+- **2FA:** bleibt aus (wie besprochen), sonst müsste der Server interaktiv
+  einen Code abfragen können, was bei einem automatischen Login nicht geht.
 
-### Gesundheit, Erholung und Alltag
+## Für deinen Vater: komplett separate zweite Instanz
 
-- `get_heart_rates`
-- `get_rhr_day`
-- `get_respiration_data`
-- `get_spo2_data`
-- `get_body_battery_events`
-- `get_all_day_events`
-- `get_stress_data`
-- `get_steps_data`
-- `get_daily_steps`
-- `get_weekly_steps`
-- `get_weekly_stress`
-- `get_intensity_minutes_data`
-- `get_weekly_intensity_minutes`
-- `get_floors`
-- `get_body_composition`
-- `get_weigh_ins`
-- `get_daily_weigh_ins`
-- `get_blood_pressure`
-- `get_hydration_data`
-- `get_lifestyle_logging_data`
-- `get_nutrition_daily_food_log`
-- `get_nutrition_daily_meals`
-- `get_nutrition_daily_settings`
+Einfachste und sauberste Lösung – **kein gemeinsamer Code, keine gemeinsame
+Instanz:**
 
-### Profil, Geraete und Ausruestung
+1. Denselben Ordner (`garmin_mcp/`) in ein zweites, ebenfalls privates
+   GitHub-Repo hochladen (z.B. `garmin-mcp-papa`)
+2. Zweiten Web Service auf Render erstellen, mit **seinen** Zugangsdaten:
+   - `GARMIN_EMAIL` / `GARMIN_PASSWORD` = seine Garmin-Zugangsdaten
+   - `MCP_LOGIN_PASSWORD` = ein neues, eigenes Passwort für ihn
+   - `ISSUER_URL` = seine eigene Render-URL
+3. Er verbindet diese zweite URL als eigenen Custom Connector in **seinem
+   eigenen** Claude-Account
 
-- `get_user_profile`
-- `get_userprofile_settings`
-- `get_unit_system`
-- `get_full_name`
-- `get_devices`
-- `get_primary_training_device`
-- `get_device_last_used`
-- `get_device_settings`
-- `get_device_solar_data`
-- `get_gear`
-- `get_gear_defaults`
-- `get_gear_stats`
-- `get_gear_activities`
+Die beiden Instanzen haben keinerlei Berührungspunkte – dein Server sieht nie
+seine Garmin-Daten und umgekehrt. Du müsstest ihm nur beim einmaligen Setup
+helfen (Render-Account, GitHub-Repo), das kannst du 1:1 nach dieser Anleitung
+für ihn wiederholen.
 
-### Workouts, Kalender und Trainingsplaene
+## Verfügbare Tools
 
-- `get_scheduled_workouts`
-- `get_scheduled_workout_by_id`
-- `get_workouts`
-- `get_workout_by_id`
-- `get_training_plans`
-- `get_training_plan_by_id`
-- `get_adaptive_training_plan_by_id`
-- `get_goals`
-- `create_interval_workout`
-- `create_easy_run`
-- `create_custom_workout`
-- `schedule_existing_workout`
-- `unschedule_workout`
-- `delete_workout`
+**Lesen:**
+`get_activities`, `get_training_status`, `get_training_readiness`,
+`get_race_predictions`, `get_sleep`, `get_hrv`, `get_body_battery`,
+`get_stress`, `get_scheduled_workouts`, `get_full_export`
 
-### Badges und Challenges
+**Schreiben:**
+`create_interval_workout`, `create_easy_run`, `create_custom_workout`,
+`delete_workout`
 
-- `get_earned_badges`
-- `get_available_badges`
-- `get_in_progress_badges`
-- `get_badge_challenges`
-- `get_available_badge_challenges`
-- `get_non_completed_badge_challenges`
-- `get_adhoc_challenges`
-- `get_inprogress_virtual_challenges`
+Alle Tools sind vollständig dokumentiert (Docstrings), Claude sieht die
+Beschreibungen automatisch beim Verbinden und weiss, wie es sie einsetzt.
 
-### Fallback fuer seltene Garmin-Leseendpunkte
-
-- `get_garmin_raw`
-
-`get_garmin_raw` ist bewusst nur fuer freigegebene Read-only-Methoden gedacht. Loeschende oder schreibende Garmin-Methoden sind dort nicht erlaubt.
-
-## Lokal testen
+## Lokal testen (optional, vor dem Deployment)
 
 ```bash
 pip install -r requirements.txt
-ISSUER_URL=http://localhost:8000 MCP_AUTO_APPROVE=true python server.py
+# .env-Datei anlegen (siehe .env.example), ISSUER_URL=http://localhost:8000
+python server.py
 ```
 
-Health Check:
-
-```text
-http://localhost:8000/health
-```
+Dann im Browser: `http://localhost:8000/.well-known/oauth-authorization-server`
+sollte JSON zurückgeben. Den kompletten Verbindungs-Flow kannst du aber nur
+über einen echten Claude-Connector oder den MCP Inspector (`npx
+@modelcontextprotocol/inspector`) end-to-end testen.

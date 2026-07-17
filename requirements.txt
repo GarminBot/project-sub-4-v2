@@ -2,3 +2,4 @@ mcp<2
 uvicorn[standard]
 garminconnect
 python-dotenv
+httpx
